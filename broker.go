@@ -15,8 +15,9 @@ import (
 )
 
 type Broker struct {
-	Topics map[string]*Topic
-	Mu     sync.RWMutex
+	Topics  map[string]*Topic
+	Mu      sync.RWMutex
+	DataDir string
 }
 
 func (b *Broker) Publish(topic string, body string) (Message, error) {
@@ -30,7 +31,8 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 			t = &Topic{
 				Name:       topic,
 				NextOffset: 0,
-				FilePath:   "data/" + topic + ".log",
+				FilePath:   filepath.Join(b.DataDir, topic+".log"),
+				MetaPath:   filepath.Join(b.DataDir, topic+".meta"),
 			}
 			b.Topics[topic] = t
 		}
@@ -83,7 +85,12 @@ func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
 	if offset == t.NextOffset {
 		return []Message{}, offset, nil
 	}
-	return t.Messages[offset:], t.NextOffset, nil
+
+	start := max(offset, t.AckedOffset)
+	if start >= t.NextOffset {
+		return []Message{}, t.NextOffset, nil
+	}
+	return t.Messages[start:], t.NextOffset, nil
 }
 
 func (b *Broker) Start(addr string) error {
@@ -131,6 +138,8 @@ func (b *Broker) handleConn(conn net.Conn) {
 			resp = b.handlePublish(req)
 		case CmdConsume:
 			resp = b.handleConsume(req)
+		case CmdAck:
+			resp = b.handleAck(req)
 		default:
 			resp = errorResponse("unknown cmd")
 		}
@@ -154,13 +163,20 @@ func (b *Broker) handleConsume(req Request) Response {
 	return Response{Status: StatusOK, Messages: msgs, NextOffset: next}
 }
 
+func (b *Broker) handleAck(req Request) Response {
+	if err := b.Ack(req.Topic, req.Offset); err != nil {
+		return Response{Status: StatusError, Error: err.Error()}
+	}
+	return Response{Status: StatusOK}
+}
+
 func (b *Broker) loadFromDisk() error {
-	err := os.MkdirAll("data", 0755)
+	err := os.MkdirAll(b.DataDir, 0755)
 	if err != nil {
 		return err
 	}
 
-	entries, err := os.ReadDir("data")
+	entries, err := os.ReadDir(b.DataDir)
 	if err != nil {
 		return err
 	}
@@ -175,7 +191,7 @@ func (b *Broker) loadFromDisk() error {
 		}
 
 		topic := strings.TrimSuffix(name, ".log")
-		path := filepath.Join("data", name)
+		path := filepath.Join(b.DataDir, name)
 		func() {
 			f, err := os.Open(path)
 			if err != nil {
@@ -200,11 +216,51 @@ func (b *Broker) loadFromDisk() error {
 				return
 			}
 
-			t := &Topic{Name: topic, Messages: msgs, NextOffset: int64(len(msgs)), FilePath: path}
+			metaPath := filepath.Join(b.DataDir, topic+".meta")
+			t := &Topic{Name: topic, Messages: msgs, NextOffset: int64(len(msgs)), FilePath: path, MetaPath: metaPath}
 			b.Topics[topic] = t
+
+			if data, err := os.ReadFile(metaPath); err == nil {
+				var meta struct {
+					AckedOffset int64 `json:"ackedOffset"`
+				}
+				if err := json.Unmarshal(data, &meta); err == nil {
+					t.AckedOffset = meta.AckedOffset
+				}
+			}
 		}()
 	}
 
+	return nil
+}
+
+func (b *Broker) Ack(topic string, offset int64) error {
+	b.Mu.RLock()
+	t, ok := b.Topics[topic]
+	b.Mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("不存在的topic: %s", topic)
+	}
+
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+
+	if offset < 0 {
+		return fmt.Errorf("无效的offset: %d", offset)
+	}
+	if offset >= t.NextOffset {
+		return fmt.Errorf("过大的offset: %d", offset)
+	}
+	if offset < t.AckedOffset {
+		return nil
+	}
+
+	newOffset := offset + 1
+	data, _ := json.Marshal(map[string]int64{"ackedOffset": newOffset})
+	if err := os.WriteFile(t.MetaPath, data, 0644); err != nil {
+		return err
+	}
+	t.AckedOffset = newOffset
 	return nil
 }
 

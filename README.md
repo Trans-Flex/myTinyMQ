@@ -1,20 +1,104 @@
 # MyTinyMQ
 
-一个基于 Go 的极简消息队列，支持内存队列、TCP 网络通信、文件持久化。
+一个基于 Go 的极简消息队列，支持内存队列、TCP 网络通信、文件持久化和消费确认（ACK）。
 
-## 协议格式
-采用一行一个 JSON 的通信协议（基于 TCP）：
-- 请求：`{"cmd":"publish", "topic":"A", "body":"hello"}`
-- 响应：`{"status":"ok", "offset":0}`
+## 功能
+
+- **发布/消费**：`Publish` 往 topic 追加消息，`Consume` 按 offset 拉取消息
+- **TCP 网络层**：一行一个 JSON 的协议，支持多客户端并发连接
+- **持久化**：消息追加写文件，重启后从磁盘恢复
+- **ACK 确认**：消费者处理完消息后发送 ACK，Broker 记录消费进度，重启后不重复投递
+- **并发安全**：Broker 和 Topic 各自加锁，`go test -race` 通过
+
+## 协议
+
+基于 TCP，一行一个 JSON，`\n` 结尾。
+
+**请求：**
+
+```json
+{"cmd": "publish", "topic": "A", "body": "hello"}
+{"cmd": "consume", "topic": "A", "offset": 0}
+{"cmd": "ack",     "topic": "A", "offset": 0}
+```
+
+**响应：**
+
+```json
+{"status": "ok", "offset": 0}
+{"status": "ok", "messages": [{"id": 0, "topic": "A", "body": "hello"}], "nextOffset": 1}
+{"status": "error", "error": "topic not found"}
+```
 
 ## 目录结构
-- `broker.go`: 核心管理逻辑
-- `topic.go`: Topic 定义
-- `message.go`: 消息定义
-- `protocol.go`: 网络协议定义
-- `broker_test.go`: 单元与集成测试
-- `data/`: 持久化日志目录
 
-## 如何运行与测试
+```text
+mini-mq/
+├── main.go            # 启动入口
+├── broker.go          # Broker：管理所有 Topic，对外提供 Publish/Consume/Ack
+├── topic.go           # Topic：消息列表、offset、ACK 进度
+├── message.go         # Message：一条消息的数据结构
+├── protocol.go        # 网络协议：命令枚举、请求/响应结构
+├── broker_test.go     # 单元测试 + 集成测试
+└── data/              # 持久化目录
+    ├── <topic>.log    # 消息日志，一行一个 JSON
+    └── <topic>.meta   # 消费进度，{"ackedOffset": N}
+```
+
+## 运行
+
+```bash
+go run .
+```
+Broker 默认监听 :9092。
+
+## 测试
+
 ```bash
 go test -race -v ./...
+```
+测试覆盖：
+- 基本发布和消费
+- 分段消费（从指定 offset 拉取）
+- 边界情况（不存在的 topic、非法 offset）  
+- 多 topic 隔离
+- 并发发布（10 goroutine × 100 条）
+- 消息持久化（重启后恢复）
+- ACK 持久化（重启后不重复投递）
+- 网络层集成测试（真实 TCP 连接）
+
+## 设计说明
+
+### 为什么消息和消费进度分开存
+
+消息是不可变的历史数据，消费进度是持续更新的状态。两者生命周期不同，存在同一文件会让日志追加和进度覆盖互相干扰。所以拆成 .log 和 .meta 两个文件：
+
+- ```.log```：只追加，不修改
+- ```.meta```：每次 ACK 覆盖写
+
+这和 Kafka 的 __consumer_offsets 设计思路一致。
+
+### 为什么 ACK 后不删消息
+
+删除是破坏性的，消息一旦删掉就无法重放、无法排查。保留消息 + 记录 AckedOffset 是主流做法，代价是需要额外的清理机制（本项目暂未实现）。
+
+### 一致性保证
+
+写入顺序是：先写磁盘，成功后再改内存。这样内存和磁盘始终一致，不会出现“内存有、磁盘没有”的脏状态。
+
+## 已知限制
+
+- 消费进度是单消费者的，不支持消费者组
+- 未 ACK 的消息不会超时重发，需要消费者主动重试
+- 消息文件不清理，长期运行会一直增长
+- 未实现认证、限流、压缩
+
+## 后续可扩展方向
+
+- 消费者组：多个消费者分摊同一 topic 的消息
+- 超时重发：未 ACK 的消息重新投递
+- 批量 ACK：减少网络往返
+- 消息文件分段 + 清理策略
+
+# License
+仅用于个人学习。

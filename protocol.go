@@ -5,6 +5,7 @@ type Cmd string
 const (
 	CmdPublish Cmd = "publish"
 	CmdConsume Cmd = "consume"
+	CmdAck     Cmd = "ack"
 )
 
 type Status string

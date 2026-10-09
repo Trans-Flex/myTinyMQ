@@ -8,7 +8,8 @@ import (
 
 func newTestBroker() *Broker {
 	return &Broker{
-		Topics: make(map[string]*Topic),
+		Topics:  make(map[string]*Topic),
+		DataDir: "data_test",
 	}
 }
 
@@ -193,7 +194,7 @@ func TestPersistence(t *testing.T) {
 	os.RemoveAll("data_test")
 	os.MkdirAll("data_test", 0755)
 
-	b1 := &Broker{Topics: make(map[string]*Topic)}
+	b1 := newTestBroker()
 	// 注意：loadFromDisk 写死了 "data"，要改成可配置，或者测试直接用 "data"
 	// 简单起见，测试里用默认 data 目录，测试后清理
 
@@ -206,7 +207,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// 模拟重启：新建 Broker，loadFromDisk
-	b2 := &Broker{Topics: make(map[string]*Topic)}
+	b2 := newTestBroker()
 	if err := b2.loadFromDisk(); err != nil {
 		t.Fatal(err)
 	}
@@ -221,5 +222,42 @@ func TestPersistence(t *testing.T) {
 	}
 	if next != 3 {
 		t.Fatalf("期望 nextOffset = 3，实际 %d", next)
+	}
+}
+
+func TestAckPersistence(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	// 第一个 Broker：发 3 条，ACK 前两条
+	b1 := newTestBroker()
+	for i := 0; i < 3; i++ {
+		if _, err := b1.Publish("ackp", "msg"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b1.Ack("ackp", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Ack("ackp", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟重启：新建 Broker，loadFromDisk
+	b2 := newTestBroker()
+	if err := b2.loadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 应该只剩第 3 条（ID=2）未确认
+	msgs, _, err := b2.Consume("ackp", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("重启后期望 1 条未确认消息，实际 %d", len(msgs))
+	}
+	if msgs[0].ID != 2 {
+		t.Errorf("期望 ID = 2，实际 %d", msgs[0].ID)
 	}
 }

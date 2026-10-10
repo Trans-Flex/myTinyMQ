@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"net"
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newTestBroker() *Broker {
@@ -259,5 +262,122 @@ func TestAckPersistence(t *testing.T) {
 	}
 	if msgs[0].ID != 2 {
 		t.Errorf("期望 ID = 2，实际 %d", msgs[0].ID)
+	}
+}
+
+func TestNetworkConsumerWithAck(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b := newTestBroker()
+
+	// 1. 启动测试 Broker，监听 :19092
+	listener, err := net.Listen("tcp", "127.0.0.1:19092")
+	if err != nil {
+		t.Fatalf("listen 失败: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go b.handleConn(conn)
+		}
+	}()
+
+	// 2. 连接并发送 3 条消息
+	conn1, err := net.Dial("tcp", "127.0.0.1:19092")
+	if err != nil {
+		t.Fatalf("dial 失败: %v", err)
+	}
+	defer conn1.Close()
+
+	enc1 := json.NewEncoder(conn1)
+	dec1 := json.NewDecoder(conn1)
+
+	for i := 0; i < 3; i++ {
+		enc1.Encode(Request{Cmd: CmdPublish, Topic: "workflow", Body: "task"})
+		var resp Response
+		dec1.Decode(&resp)
+		if resp.Status != StatusOK {
+			t.Fatalf("publish 失败: %+v", resp)
+		}
+	}
+
+	// 3. 启动消费者，拉取消息
+	conn2, err := net.Dial("tcp", "127.0.0.1:19092")
+	if err != nil {
+		t.Fatalf("consumer dial 失败: %v", err)
+	}
+	enc2 := json.NewEncoder(conn2)
+	dec2 := json.NewDecoder(conn2)
+
+	enc2.Encode(Request{Cmd: CmdConsume, Topic: "workflow", Offset: 0})
+	var resp Response
+	dec2.Decode(&resp)
+
+	if len(resp.Messages) != 3 {
+		t.Fatalf("期望 3 条消息，实际 %d 条", len(resp.Messages))
+	}
+
+	// 4. 模拟处理消息，然后 ACK 前两条
+	for i := 0; i < 2; i++ {
+		time.Sleep(10 * time.Millisecond) // 模拟处理
+		enc2.Encode(Request{Cmd: CmdAck, Topic: "workflow", Offset: int64(i)})
+		var ackResp Response
+		dec2.Decode(&ackResp)
+		if ackResp.Status != StatusOK {
+			t.Fatalf("ACK %d 失败: %+v", i, ackResp)
+		}
+	}
+
+	// 5. 模拟消费者“崩溃”，断开连接
+	conn2.Close()
+
+	// 6. 启动新的消费者，再次拉取，应该只剩第 3 条
+	conn3, err := net.Dial("tcp", "127.0.0.1:19092")
+	if err != nil {
+		t.Fatalf("new consumer dial 失败: %v", err)
+	}
+	defer conn3.Close()
+
+	enc3 := json.NewEncoder(conn3)
+	dec3 := json.NewDecoder(conn3)
+
+	enc3.Encode(Request{Cmd: CmdConsume, Topic: "workflow", Offset: 0})
+	var resp3 Response
+	dec3.Decode(&resp3)
+
+	if len(resp3.Messages) != 1 {
+		t.Fatalf("重启消费者后期望 1 条未确认消息，实际 %d 条", len(resp3.Messages))
+	}
+	if resp3.Messages[0].Body != "task" || resp3.Messages[0].ID != 2 {
+		t.Errorf("期望拿到第 3 条消息(ID=2)，实际 ID=%d", resp3.Messages[0].ID)
+	}
+}
+
+func TestRedelivery(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b := newTestBroker()
+	b.Publish("rd", "msg1")
+
+	// 第一次消费
+	msgs, _, _ := b.Consume("rd", 0)
+	if len(msgs) != 1 {
+		t.Fatalf("期望 1 条")
+	}
+
+	// 不 ACK，等超时
+	time.Sleep(600 * time.Millisecond)
+
+	// 后台清理虽然没跑，但 Consume 依然返回（Pending 里存在不影响）
+	msgs, _, _ = b.Consume("rd", 0)
+	if len(msgs) != 1 {
+		t.Fatalf("超时后应重投，实际 %d 条", len(msgs))
 	}
 }

@@ -29,10 +29,12 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 		t, ok = b.Topics[topic]
 		if !ok {
 			t = &Topic{
-				Name:       topic,
-				NextOffset: 0,
-				FilePath:   filepath.Join(b.DataDir, topic+".log"),
-				MetaPath:   filepath.Join(b.DataDir, topic+".meta"),
+				Name:            topic,
+				NextOffset:      0,
+				FilePath:        filepath.Join(b.DataDir, topic+".log"),
+				MetaPath:        filepath.Join(b.DataDir, topic+".meta"),
+				Pending:         make(map[int64]time.Time),
+				DeliveryTimeout: 5 * time.Second,
 			}
 			b.Topics[topic] = t
 		}
@@ -90,7 +92,17 @@ func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
 	if start >= t.NextOffset {
 		return []Message{}, t.NextOffset, nil
 	}
-	return t.Messages[start:], t.NextOffset, nil
+
+	now := time.Now()
+	var result []Message
+
+	for i := start; i < t.NextOffset; i++ {
+		msg := t.Messages[i]
+		result = append(result, msg)
+		t.Pending[msg.ID] = now // 只记录，不跳过
+	}
+
+	return result, t.NextOffset, nil
 }
 
 func (b *Broker) Start(addr string) error {
@@ -217,7 +229,14 @@ func (b *Broker) loadFromDisk() error {
 			}
 
 			metaPath := filepath.Join(b.DataDir, topic+".meta")
-			t := &Topic{Name: topic, Messages: msgs, NextOffset: int64(len(msgs)), FilePath: path, MetaPath: metaPath}
+			t := &Topic{Name: topic,
+				Messages:        msgs,
+				NextOffset:      int64(len(msgs)),
+				FilePath:        path,
+				MetaPath:        metaPath,
+				Pending:         make(map[int64]time.Time),
+				DeliveryTimeout: 5 * time.Second,
+			}
 			b.Topics[topic] = t
 
 			if data, err := os.ReadFile(metaPath); err == nil {
@@ -261,7 +280,35 @@ func (b *Broker) Ack(topic string, offset int64) error {
 		return err
 	}
 	t.AckedOffset = newOffset
+	delete(t.Pending, offset) //已处理，从队列中删除
 	return nil
+}
+
+func (b *Broker) startRedeliveryLoop() {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			b.Mu.RLock()
+			topics := make([]*Topic, 0, len(b.Topics))
+			for _, t := range b.Topics {
+				topics = append(topics, t)
+			}
+			b.Mu.RUnlock()
+
+			now := time.Now()
+			for _, t := range topics {
+				t.Mu.Lock()
+				for id, deliveredAt := range t.Pending {
+					if now.Sub(deliveredAt) > t.DeliveryTimeout {
+						delete(t.Pending, id)
+					}
+				}
+				t.Mu.Unlock()
+			}
+		}
+	}()
 }
 
 func errorResponse(msg string) Response {

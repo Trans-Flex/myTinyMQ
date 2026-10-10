@@ -33,7 +33,7 @@ func TestPublishAndConsume(t *testing.T) {
 		t.Fatalf("Publish 失败: %v", err)
 	}
 
-	msgs, nextOffset, err := b.Consume("topicA", 0)
+	msgs, nextOffset, err := b.Consume("topicA", "default", 0)
 	if err != nil {
 		t.Fatalf("Consume 返回错误: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestConsumeFromOffset(t *testing.T) {
 	}
 
 	// 从 0 开始，拿到全部 5 条
-	msgs, next, err := b.Consume("topicB", 0)
+	msgs, next, err := b.Consume("topicB", "default", 0)
 	if err != nil {
 		t.Fatalf("Consume 错误: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestConsumeFromOffset(t *testing.T) {
 	}
 
 	// 从 3 开始，拿到 2 条
-	msgs, next, err = b.Consume("topicB", 3)
+	msgs, next, err = b.Consume("topicB", "default", 3)
 	if err != nil {
 		t.Fatalf("Consume 错误: %v", err)
 	}
@@ -96,26 +96,26 @@ func TestConsumeEdgeCases(t *testing.T) {
 	b := newTestBroker()
 
 	// 1. 不存在的 topic
-	_, _, err := b.Consume("notExist", 0)
+	_, _, err := b.Consume("notExist", "default", 0)
 	if err == nil {
 		t.Error("期望消费不存在的 topic 返回 error，实际 nil")
 	}
 
 	// 2. 空 topic，offset = 0
 	b.Publish("empty", "only")
-	_, _, err = b.Consume("empty", 1)
+	_, _, err = b.Consume("empty", "default", 1)
 	if err != nil {
 		t.Errorf("offset == NextOffset 时期望 nil error，实际 %v", err)
 	}
 
 	// 3. offset < 0
-	_, _, err = b.Consume("empty", -1)
+	_, _, err = b.Consume("empty", "default", -1)
 	if err == nil {
 		t.Error("期望 offset < 0 返回 error，实际 nil")
 	}
 
 	// 4. offset > NextOffset
-	_, _, err = b.Consume("empty", 100)
+	_, _, err = b.Consume("empty", "default", 100)
 	if err == nil {
 		t.Error("期望 offset > NextOffset 返回 error，实际 nil")
 	}
@@ -129,8 +129,8 @@ func TestMultipleTopics(t *testing.T) {
 	b.Publish("A", "a2")
 	b.Publish("B", "b1")
 
-	msgsA, _, _ := b.Consume("A", 0)
-	msgsB, _, _ := b.Consume("B", 0)
+	msgsA, _, _ := b.Consume("A", "default", 0)
+	msgsB, _, _ := b.Consume("B", "default", 0)
 
 	if len(msgsA) != 2 {
 		t.Errorf("topic A 期望 2 条，实际 %d 条", len(msgsA))
@@ -165,7 +165,7 @@ func TestConcurrentPublish(t *testing.T) {
 	}
 	wg.Wait()
 
-	msgs, next, err := b.Consume("concurrent", 0)
+	msgs, next, err := b.Consume("concurrent", "default", 0)
 	if err != nil {
 		t.Fatalf("Consume 错误: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// 验证数据还在
-	msgs, next, err := b2.Consume("persist", 0)
+	msgs, next, err := b2.Consume("persist", "default", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,10 +239,10 @@ func TestAckPersistence(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := b1.Ack("ackp", 0); err != nil {
+	if err := b1.Ack("ackp", "default", 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := b1.Ack("ackp", 1); err != nil {
+	if err := b1.Ack("ackp", "default", 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,7 +253,7 @@ func TestAckPersistence(t *testing.T) {
 	}
 
 	// 应该只剩第 3 条（ID=2）未确认
-	msgs, _, err := b2.Consume("ackp", 0)
+	msgs, _, err := b2.Consume("ackp", "default", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestRedelivery(t *testing.T) {
 	b.Publish("rd", "msg1")
 
 	// 第一次消费
-	msgs, _, _ := b.Consume("rd", 0)
+	msgs, _, _ := b.Consume("rd", "default", 0)
 	if len(msgs) != 1 {
 		t.Fatalf("期望 1 条")
 	}
@@ -376,8 +376,58 @@ func TestRedelivery(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 
 	// 后台清理虽然没跑，但 Consume 依然返回（Pending 里存在不影响）
-	msgs, _, _ = b.Consume("rd", 0)
+	msgs, _, _ = b.Consume("rd", "default", 0)
 	if len(msgs) != 1 {
 		t.Fatalf("超时后应重投，实际 %d 条", len(msgs))
+	}
+}
+
+func TestGroupIsolation(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b := newTestBroker()
+
+	// 发 3 条
+	for i := 0; i < 3; i++ {
+		if _, err := b.Publish("iso", "msg"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 组 A 消费全部 3 条，ACK 前两条
+	msgsA, _, err := b.Consume("iso", "groupA", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgsA) != 3 {
+		t.Fatalf("组 A 期望 3 条，实际 %d 条", len(msgsA))
+	}
+	if err := b.Ack("iso", "groupA", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ack("iso", "groupA", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 组 B 消费，应该拿到全部 3 条（不受组 A 的 ACK 影响）
+	msgsB, _, err := b.Consume("iso", "groupB", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgsB) != 3 {
+		t.Fatalf("组 B 期望 3 条，实际 %d 条", len(msgsB))
+	}
+
+	// 组 A 再消费，应该只剩第 3 条（ID=2）
+	msgsA2, _, err := b.Consume("iso", "groupA", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgsA2) != 1 {
+		t.Fatalf("组 A 第二次期望 1 条，实际 %d 条", len(msgsA2))
+	}
+	if msgsA2[0].ID != 2 {
+		t.Errorf("组 A 期望 ID = 2，实际 %d", msgsA2[0].ID)
 	}
 }

@@ -1,6 +1,6 @@
 # MyTinyMQ
 
-一个基于 Go 的极简消息队列，支持内存队列、TCP 网络通信、文件持久化和消费确认（ACK）。
+一个基于 Go 的极简消息队列，支持内存队列、TCP 网络、消息持久化、ACK 确认、超时重投和消费者组。
 
 ## 功能
 
@@ -9,6 +9,7 @@
 - **消息持久化**：每条消息追加写到 `.log` 文件，重启后从磁盘恢复
 - **ACK 确认**：消费者处理完消息后发送 ACK，Broker 记录消费进度，重启后不重复投递
 - **超时重投**：已投递但未 ACK 的消息，超过 `DeliveryTimeout` 后重新变为可消费
+- **消费者组**：不同组之间进度独立，互不影响
 - **并发安全**：Broker 和 Topic 各自加锁，`go test -race` 全部通过
 
 ## 协议
@@ -19,9 +20,11 @@
 
 ```json
 {"cmd": "publish", "topic": "A", "body": "hello"}
-{"cmd": "consume", "topic": "A", "offset": 0}
-{"cmd": "ack",     "topic": "A", "offset": 0}
+{"cmd": "consume", "topic": "A", "offset": 0, "group": "groupA"}
+{"cmd": "ack",     "topic": "A", "offset": 0, "group": "groupA"}
 ```
+
+```group``` 字段可选，不填时默认使用 ```"default"``` 组
 
 **响应：**
 
@@ -68,7 +71,8 @@ go test -race -v ./...
 - 消息持久化（重启后恢复）
 - ACK 持久化（重启后不重复投递）
 - 网络层集成测试（真实 TCP 连接，模拟消费者 ACK + 崩溃）
-- 超时重投（未 ACK 的消息超时后可重新消费
+- 超时重投（未 ACK 的消息超时后可重新消费）
+- 消费者组隔离（组 A 的 ACK 不影响组 B）
 
 ## 设计说明
 
@@ -91,24 +95,43 @@ go test -race -v ./...
 
 ### 超时重投
 
-```Topic``` 维护一个 ```Pending map[int64]time.Time```，记录已投递但未 ACK 的消息及其投递时间。
+```GroupState``` 维护一个 ```Pending map[int64]time.Time```，记录该组已投递但未 ACK 的消息及其投递时间。
+
 - ```Consume``` 时，把返回的消息记入 ```Pending```；
 - ```Ack``` 时，从 ```Pending``` 中删除；
-- 后台 ```goroutine``` 每秒扫描一次，超过 ```DeliveryTimeout```（默认 5 秒）的条目从 ```Pending``` 中移除，让它们重新变为可消费。
+
+后台 goroutine 每秒扫描一次，超过 ```DeliveryTimeout```（默认 5 秒）的条目从 ```Pending``` 中移除，让它们重新变为可消费。
 
 这实现了至少一次（at-least-once）语义：消息可能被重复投递，但不会丢。
 
+### 消费者组
+
+每个组有独立的 ```GroupState```：
+```go
+type GroupState struct {
+    AckedOffset    int64
+    NextReadOffset int64
+    Pending        map[int64]time.Time
+}
+```
+
+- 不同组之间：```AckedOffset``` 和 ```Pending``` 完全独立，组 A 的消费进度不影响组 B；
+- 同一个组内：共享 ```AckedOffset``` 和 ```Pending```（组内多消费者分发暂未实现）；
+- 组名通过协议的 ```group``` 字段传递，不填默认 ```"default"```。
+
+```NextReadOffset``` 字段已预留，用于后续实现组内多消费者分摊消息。
+
 ## 已知限制
 
-- 消费进度是单消费者的，不支持消费者组
+- 组内多消费者分发（```NextReadOffset```）未实现，同一组内多个消费者会重复消费
 - 未 ACK 的消息超时后重新投递，但消费者无法主动拒绝（无 NACK）
 - 消息文件不清理，长期运行会一直增长
 - 未实现认证、限流、压缩
-- DeliveryTimeout 硬编码在 Topic 中，未做成可配置
+- ```DeliveryTimeout``` 硬编码在 Topic 中，未做成可配置
 
 ## 后续可扩展方向
 
-- 消费者组：多个消费者分摊同一 topic 的消息
+- 组内多消费者分发：用 NextReadOffset 让同一组内的消费者各拿一段
 - 批量 ACK：减少网络往返
 - NACK + 死信队列：消费者主动拒绝的消息进入死信
 - 消息文件分段 + 清理策略

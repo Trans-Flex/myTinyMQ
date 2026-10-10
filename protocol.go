@@ -20,6 +20,7 @@ type Request struct {
 	Topic  string `json:"topic"`
 	Body   string `json:"body,omitempty"`
 	Offset int64  `json:"offset,omitempty"`
+	Group  string `json:"group,omitempty"`
 }
 
 type Response struct {
@@ -28,4 +29,11 @@ type Response struct {
 	Offset     int64     `json:"offset,omitempty"`
 	Messages   []Message `json:"message,omitempty"`
 	NextOffset int64     `json:"nextOffset,omitempty"`
+}
+
+func groupOrDefault(req Request) string {
+	if req.Group == "" {
+		return "default"
+	}
+	return req.Group
 }

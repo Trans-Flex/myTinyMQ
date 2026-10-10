@@ -5,14 +5,19 @@ import (
 	"time"
 )
 
+type GroupState struct {
+	AckedOffset    int64
+	NextReadOffset int64
+	Pending        map[int64]time.Time
+}
+
 type Topic struct {
 	Name            string
 	Messages        []Message
 	NextOffset      int64
-	AckedOffset     int64
+	GroupStates     map[string]*GroupState
 	Mu              sync.Mutex
 	FilePath        string
 	MetaPath        string
-	Pending         map[int64]time.Time
 	DeliveryTimeout time.Duration
 }

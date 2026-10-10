@@ -33,7 +33,7 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 				NextOffset:      0,
 				FilePath:        filepath.Join(b.DataDir, topic+".log"),
 				MetaPath:        filepath.Join(b.DataDir, topic+".meta"),
-				Pending:         make(map[int64]time.Time),
+				GroupStates:     make(map[string]*GroupState),
 				DeliveryTimeout: 5 * time.Second,
 			}
 			b.Topics[topic] = t
@@ -68,7 +68,7 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 	return msg, nil
 }
 
-func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
+func (b *Broker) Consume(topic, group string, offset int64) ([]Message, int64, error) {
 	b.Mu.RLock()
 	t, ok := b.Topics[topic]
 	b.Mu.RUnlock()
@@ -78,6 +78,17 @@ func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
 
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
+
+	g, ok := t.GroupStates[group]
+	if !ok {
+		g = &GroupState{
+			AckedOffset:    0,
+			NextReadOffset: 0,
+			Pending:        make(map[int64]time.Time),
+		}
+		t.GroupStates[group] = g
+	}
+
 	if offset < 0 {
 		return []Message{}, offset, fmt.Errorf("不合法的offset: %d", offset)
 	}
@@ -88,7 +99,7 @@ func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
 		return []Message{}, offset, nil
 	}
 
-	start := max(offset, t.AckedOffset)
+	start := max(offset, g.AckedOffset)
 	if start >= t.NextOffset {
 		return []Message{}, t.NextOffset, nil
 	}
@@ -99,7 +110,7 @@ func (b *Broker) Consume(topic string, offset int64) ([]Message, int64, error) {
 	for i := start; i < t.NextOffset; i++ {
 		msg := t.Messages[i]
 		result = append(result, msg)
-		t.Pending[msg.ID] = now // 只记录，不跳过
+		g.Pending[msg.ID] = now // 只记录，不跳过
 	}
 
 	return result, t.NextOffset, nil
@@ -168,7 +179,8 @@ func (b *Broker) handlePublish(req Request) Response {
 }
 
 func (b *Broker) handleConsume(req Request) Response {
-	msgs, next, err := b.Consume(req.Topic, req.Offset)
+	group := groupOrDefault(req)
+	msgs, next, err := b.Consume(req.Topic, group, req.Offset)
 	if err != nil {
 		return Response{Status: StatusError, Error: err.Error()}
 	}
@@ -176,7 +188,8 @@ func (b *Broker) handleConsume(req Request) Response {
 }
 
 func (b *Broker) handleAck(req Request) Response {
-	if err := b.Ack(req.Topic, req.Offset); err != nil {
+	group := groupOrDefault(req)
+	if err := b.Ack(req.Topic, group, req.Offset); err != nil {
 		return Response{Status: StatusError, Error: err.Error()}
 	}
 	return Response{Status: StatusOK}
@@ -234,17 +247,31 @@ func (b *Broker) loadFromDisk() error {
 				NextOffset:      int64(len(msgs)),
 				FilePath:        path,
 				MetaPath:        metaPath,
-				Pending:         make(map[int64]time.Time),
+				GroupStates:     make(map[string]*GroupState),
 				DeliveryTimeout: 5 * time.Second,
 			}
 			b.Topics[topic] = t
 
 			if data, err := os.ReadFile(metaPath); err == nil {
 				var meta struct {
-					AckedOffset int64 `json:"ackedOffset"`
+					Groups map[string]int64 `json:"groups"`
 				}
 				if err := json.Unmarshal(data, &meta); err == nil {
-					t.AckedOffset = meta.AckedOffset
+					for name, acked := range meta.Groups {
+						t.GroupStates[name] = &GroupState{
+							AckedOffset:    acked,
+							NextReadOffset: acked,
+							Pending:        make(map[int64]time.Time),
+						}
+					}
+
+				}
+			}
+			if len(t.GroupStates) == 0 {
+				t.GroupStates["default"] = &GroupState{
+					AckedOffset:    0,
+					NextReadOffset: 0,
+					Pending:        make(map[int64]time.Time),
 				}
 			}
 		}()
@@ -253,7 +280,7 @@ func (b *Broker) loadFromDisk() error {
 	return nil
 }
 
-func (b *Broker) Ack(topic string, offset int64) error {
+func (b *Broker) Ack(topic, group string, offset int64) error {
 	b.Mu.RLock()
 	t, ok := b.Topics[topic]
 	b.Mu.RUnlock()
@@ -264,23 +291,39 @@ func (b *Broker) Ack(topic string, offset int64) error {
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
 
+	g, ok := t.GroupStates[group]
+	if !ok {
+		g = &GroupState{
+			AckedOffset:    0,
+			NextReadOffset: 0,
+			Pending:        make(map[int64]time.Time),
+		}
+		t.GroupStates[group] = g
+	}
+
 	if offset < 0 {
 		return fmt.Errorf("无效的offset: %d", offset)
 	}
 	if offset >= t.NextOffset {
 		return fmt.Errorf("过大的offset: %d", offset)
 	}
-	if offset < t.AckedOffset {
+	if offset < g.AckedOffset {
 		return nil
 	}
 
 	newOffset := offset + 1
-	data, _ := json.Marshal(map[string]int64{"ackedOffset": newOffset})
+	groups := make(map[string]int64)
+	for name, gs := range t.GroupStates {
+		groups[name] = gs.AckedOffset
+	}
+	groups[group] = newOffset
+
+	data, _ := json.Marshal(map[string]any{"groups": groups})
 	if err := os.WriteFile(t.MetaPath, data, 0644); err != nil {
 		return err
 	}
-	t.AckedOffset = newOffset
-	delete(t.Pending, offset) //已处理，从队列中删除
+	g.AckedOffset = newOffset
+	delete(g.Pending, offset) //已处理，从队列中删除
 	return nil
 }
 
@@ -300,9 +343,11 @@ func (b *Broker) startRedeliveryLoop() {
 			now := time.Now()
 			for _, t := range topics {
 				t.Mu.Lock()
-				for id, deliveredAt := range t.Pending {
-					if now.Sub(deliveredAt) > t.DeliveryTimeout {
-						delete(t.Pending, id)
+				for _, g := range t.GroupStates {
+					for id, deliveredAt := range g.Pending {
+						if now.Sub(deliveredAt) > t.DeliveryTimeout {
+							delete(g.Pending, id)
+						}
 					}
 				}
 				t.Mu.Unlock()

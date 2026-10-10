@@ -1,3 +1,5 @@
 ### MQ data ###
 data/
 data_test/
+*.log
+*.meta

@@ -4,12 +4,12 @@
 
 ## 功能
 
-- **发布/消费**：`Publish` 往 topic 追加消息，`Consume` 按 offset 拉取消息
+- **发布/消费**：`Publish` 往 topic 追加消息，`Consume` 按消费者组拉取消息
 - **TCP 网络层**：一行一个 JSON 的协议，支持多客户端并发连接
 - **消息持久化**：每条消息追加写到 `.log` 文件，重启后从磁盘恢复
 - **ACK 确认**：消费者处理完消息后发送 ACK，Broker 记录消费进度，重启后不重复投递
 - **超时重投**：已投递但未 ACK 的消息，超过 `DeliveryTimeout` 后重新变为可消费
-- **消费者组**：不同组之间进度独立，互不影响
+- **消费者组**：不同组之间进度独立；同一组内多个消费者按 `BatchSize` 分摊消息
 - **并发安全**：Broker 和 Topic 各自加锁，`go test -race` 全部通过
 
 ## 协议
@@ -20,7 +20,7 @@
 
 ```json
 {"cmd": "publish", "topic": "A", "body": "hello"}
-{"cmd": "consume", "topic": "A", "offset": 0, "group": "groupA"}
+{"cmd": "consume", "topic": "A", "group": "groupA"}
 {"cmd": "ack",     "topic": "A", "offset": 0, "group": "groupA"}
 ```
 
@@ -64,8 +64,7 @@ go test -race -v ./...
 测试覆盖：
 
 - 基本发布和消费
-- 分段消费（从指定 offset 拉取）
-- 边界情况（不存在的 topic、非法 offset）
+- 边界情况（不存在的 topic）
 - 多 topic 隔离
 - 并发发布（10 goroutine × 100 条）
 - 消息持久化（重启后恢复）
@@ -73,6 +72,8 @@ go test -race -v ./...
 - 网络层集成测试（真实 TCP 连接，模拟消费者 ACK + 崩溃）
 - 超时重投（未 ACK 的消息超时后可重新消费）
 - 消费者组隔离（组 A 的 ACK 不影响组 B）
+- 组内不重复（同一组两个消费者拿到不重叠的消息）
+- 组内分摊（BatchSize 限制下，多个消费者各拿一批）
 
 ## 设计说明
 
@@ -93,49 +94,71 @@ go test -race -v ./...
 
 写入顺序是：先写磁盘，成功后再改内存。这样内存和磁盘始终一致，不会出现“内存有、磁盘没有”的脏状态。
 
-### 超时重投
+### 消费者组模型
 
-```GroupState``` 维护一个 ```Pending map[int64]time.Time```，记录该组已投递但未 ACK 的消息及其投递时间。
+```GroupState``` 结构：
 
-- ```Consume``` 时，把返回的消息记入 ```Pending```；
-- ```Ack``` 时，从 ```Pending``` 中删除；
-
-后台 goroutine 每秒扫描一次，超过 ```DeliveryTimeout```（默认 5 秒）的条目从 ```Pending``` 中移除，让它们重新变为可消费。
-
-这实现了至少一次（at-least-once）语义：消息可能被重复投递，但不会丢。
-
-### 消费者组
-
-每个组有独立的 ```GroupState```：
 ```go
 type GroupState struct {
-    AckedOffset    int64
-    NextReadOffset int64
-    Pending        map[int64]time.Time
+    AckedOffset int64
+    Pending     map[int64]time.Time
 }
 ```
 
-- 不同组之间：```AckedOffset``` 和 ```Pending``` 完全独立，组 A 的消费进度不影响组 B；
-- 同一个组内：共享 ```AckedOffset``` 和 ```Pending```（组内多消费者分发暂未实现）；
-- 组名通过协议的 ```group``` 字段传递，不填默认 ```"default"```。
+- ```AckedOffset```：这个组已确认到哪；
+- ```Pending```：这个组已分发但未 ACK 的消息，key 是消息 ID，value 是投递时间。
 
-```NextReadOffset``` 字段已预留，用于后续实现组内多消费者分摊消息。
+```Consume``` 的分发逻辑：
+
+1. 从 ```AckedOffset``` 开始扫描消息；
+2. 跳过 ```Pending``` 里未超时的（说明已有人领了，正在处理）；
+3. 收满 ```BatchSize``` 条就停；
+4. 把收进结果的消息记入 ```Pending```。
+
+这实现了组内分摊：消费者 A 领了前 100 条，B 来时 A 还没 ACK，那 100 条在 Pending 里被跳过，B 自动拿到下一批。
+
+不同组之间完全独立：每个组有自己的 AckedOffset 和 Pending，互不影响。
+
+### 超时重投
+
+后台 goroutine 每秒扫描一次所有组的 ```Pending```，超过 ```DeliveryTimeout``` 的条目从 ```Pending``` 中删除，让它们重新变为可消费。
+
+这实现了至少一次（at-least-once）语义：消息可能被重复投递，但不会丢。
+
+### 为什么 ```Consume``` 不接收 offset 参数
+
+在这个模型下，消费位置由 ```AckedOffset``` 和 ```Pending``` 共同决定，消费者不需要也不应该指定从哪读。这是"Broker 分发"模型，而不是 Kafka 那种"消费者自己维护 offset"的模型。
+
+Kafka 有分区概念，一个分区同一时间只有一个消费者，所以消费者自己维护 offset 是安全的。我们没有分区，如果消费者自己传 offset，多个消费者会抢同一段，所以选择 Broker 分发。
+
+### 可配置参数
+
+```Broker``` 上有两个可配置字段：
+
+- ```DeliveryTimeout```：超时重投的阈值，默认 5 秒；
+- ```BatchSize```：每次 ```Consume``` 最多返回多少条，默认 100。
+
+测试里通过 ```newTestBroker``` 设短超时（200ms），避免测试跑 5 秒。
 
 ## 已知限制
 
-- 组内多消费者分发（```NextReadOffset```）未实现，同一组内多个消费者会重复消费
-- 未 ACK 的消息超时后重新投递，但消费者无法主动拒绝（无 NACK）
-- 消息文件不清理，长期运行会一直增长
-- 未实现认证、限流、压缩
-- ```DeliveryTimeout``` 硬编码在 Topic 中，未做成可配置
+- ACK 之后不删消息，消息文件不清理，长期运行会一直增长；
+- 不支持消费者主动拒绝（NACK），只能靠超时重投；
+- 不支持 seek / 重放历史消息，消费者只能从 ```AckedOffset``` 往后读；
+- ```Pending``` 里的消息只能靠超时清理，消费者 ACK 后才能从 ```Pending``` 移除；
+- 单机版，没有分布式协调，```Broker``` 重启后 ```Pending``` 会丢失（未 ACK 的消息会重新可消费，但已投递未 ACK 的"投递状态"不保留）；
+- 未实现认证、限流、压缩；
+- 没有 ```NewBroker``` 构造函数，所有字段需要手动初始化，容易漏设 ```BatchSize``` 或 ```DeliveryTimeout```等。
 
 ## 后续可扩展方向
 
-- 组内多消费者分发：用 NextReadOffset 让同一组内的消费者各拿一段
-- 批量 ACK：减少网络往返
-- NACK + 死信队列：消费者主动拒绝的消息进入死信
-- 消息文件分段 + 清理策略
-- 可配置的 DeliveryTimeout
+- ```NewBroker``` 构造函数：集中初始化，避免漏设字段；
+- 批量 ACK：一次 ACK 多个 offset，减少网络往返；
+- NACK + 死信队列：消费者主动拒绝的消息进入死信；
+- 消息文件分段 + 清理策略：按大小或时间分段，删除旧段；
+- 消息压缩：对 ```.log``` 文件做压缩；
+- 分区支持：一个 topic 分多个 partition，每个 partition 独立消费；
+- 分布式部署：多机 Broker + 一致性协议（Raft）。
 
 # License
 仅用于个人学习。

@@ -7,7 +7,7 @@ import (
 )
 
 func TestNetworkPublishConsume(t *testing.T) {
-	b := &Broker{Topics: make(map[string]*Topic)}
+	b := newTestBroker()
 
 	// 1. 起临时 listener
 	listener, err := net.Listen("tcp", "127.0.0.1:19092")

@@ -15,9 +15,11 @@ import (
 )
 
 type Broker struct {
-	Topics  map[string]*Topic
-	Mu      sync.RWMutex
-	DataDir string
+	Topics          map[string]*Topic
+	Mu              sync.RWMutex
+	DataDir         string
+	DeliveryTimeout time.Duration
+	BatchSize       int64
 }
 
 func (b *Broker) Publish(topic string, body string) (Message, error) {
@@ -34,7 +36,8 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 				FilePath:        filepath.Join(b.DataDir, topic+".log"),
 				MetaPath:        filepath.Join(b.DataDir, topic+".meta"),
 				GroupStates:     make(map[string]*GroupState),
-				DeliveryTimeout: 5 * time.Second,
+				DeliveryTimeout: b.DeliveryTimeout,
+				BatchSize:       b.BatchSize,
 			}
 			b.Topics[topic] = t
 		}
@@ -68,12 +71,12 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 	return msg, nil
 }
 
-func (b *Broker) Consume(topic, group string, offset int64) ([]Message, int64, error) {
+func (b *Broker) Consume(topic, group string) ([]Message, int64, error) {
 	b.Mu.RLock()
 	t, ok := b.Topics[topic]
 	b.Mu.RUnlock()
 	if !ok {
-		return []Message{}, offset, fmt.Errorf("不存在的topic")
+		return []Message{}, 0, fmt.Errorf("不存在的topic")
 	}
 
 	t.Mu.Lock()
@@ -82,24 +85,13 @@ func (b *Broker) Consume(topic, group string, offset int64) ([]Message, int64, e
 	g, ok := t.GroupStates[group]
 	if !ok {
 		g = &GroupState{
-			AckedOffset:    0,
-			NextReadOffset: 0,
-			Pending:        make(map[int64]time.Time),
+			AckedOffset: 0,
+			Pending:     make(map[int64]time.Time),
 		}
 		t.GroupStates[group] = g
 	}
 
-	if offset < 0 {
-		return []Message{}, offset, fmt.Errorf("不合法的offset: %d", offset)
-	}
-	if offset > t.NextOffset {
-		return []Message{}, offset, fmt.Errorf("超过NextOffset的offset: %d", offset)
-	}
-	if offset == t.NextOffset {
-		return []Message{}, offset, nil
-	}
-
-	start := max(offset, g.AckedOffset)
+	start := g.AckedOffset
 	if start >= t.NextOffset {
 		return []Message{}, t.NextOffset, nil
 	}
@@ -107,10 +99,15 @@ func (b *Broker) Consume(topic, group string, offset int64) ([]Message, int64, e
 	now := time.Now()
 	var result []Message
 
-	for i := start; i < t.NextOffset; i++ {
+	var count int64 = 0
+	for i := start; i < t.NextOffset && count < t.BatchSize; i++ {
 		msg := t.Messages[i]
+		if deliveredAt, ok := g.Pending[msg.ID]; ok && now.Sub(deliveredAt) < t.DeliveryTimeout {
+			continue
+		}
 		result = append(result, msg)
-		g.Pending[msg.ID] = now // 只记录，不跳过
+		g.Pending[msg.ID] = now
+		count++
 	}
 
 	return result, t.NextOffset, nil
@@ -180,7 +177,7 @@ func (b *Broker) handlePublish(req Request) Response {
 
 func (b *Broker) handleConsume(req Request) Response {
 	group := groupOrDefault(req)
-	msgs, next, err := b.Consume(req.Topic, group, req.Offset)
+	msgs, next, err := b.Consume(req.Topic, group)
 	if err != nil {
 		return Response{Status: StatusError, Error: err.Error()}
 	}
@@ -248,7 +245,8 @@ func (b *Broker) loadFromDisk() error {
 				FilePath:        path,
 				MetaPath:        metaPath,
 				GroupStates:     make(map[string]*GroupState),
-				DeliveryTimeout: 5 * time.Second,
+				DeliveryTimeout: b.DeliveryTimeout,
+				BatchSize:       b.BatchSize,
 			}
 			b.Topics[topic] = t
 
@@ -259,9 +257,8 @@ func (b *Broker) loadFromDisk() error {
 				if err := json.Unmarshal(data, &meta); err == nil {
 					for name, acked := range meta.Groups {
 						t.GroupStates[name] = &GroupState{
-							AckedOffset:    acked,
-							NextReadOffset: acked,
-							Pending:        make(map[int64]time.Time),
+							AckedOffset: acked,
+							Pending:     make(map[int64]time.Time),
 						}
 					}
 
@@ -269,9 +266,8 @@ func (b *Broker) loadFromDisk() error {
 			}
 			if len(t.GroupStates) == 0 {
 				t.GroupStates["default"] = &GroupState{
-					AckedOffset:    0,
-					NextReadOffset: 0,
-					Pending:        make(map[int64]time.Time),
+					AckedOffset: 0,
+					Pending:     make(map[int64]time.Time),
 				}
 			}
 		}()
@@ -294,9 +290,8 @@ func (b *Broker) Ack(topic, group string, offset int64) error {
 	g, ok := t.GroupStates[group]
 	if !ok {
 		g = &GroupState{
-			AckedOffset:    0,
-			NextReadOffset: 0,
-			Pending:        make(map[int64]time.Time),
+			AckedOffset: 0,
+			Pending:     make(map[int64]time.Time),
 		}
 		t.GroupStates[group] = g
 	}

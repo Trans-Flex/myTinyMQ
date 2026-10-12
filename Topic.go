@@ -6,9 +6,8 @@ import (
 )
 
 type GroupState struct {
-	AckedOffset    int64
-	NextReadOffset int64
-	Pending        map[int64]time.Time
+	AckedOffset int64
+	Pending     map[int64]time.Time
 }
 
 type Topic struct {
@@ -20,4 +19,5 @@ type Topic struct {
 	FilePath        string
 	MetaPath        string
 	DeliveryTimeout time.Duration
+	BatchSize       int64
 }

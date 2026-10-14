@@ -10,12 +10,7 @@ import (
 )
 
 func newTestBroker() *Broker {
-	return &Broker{
-		Topics:          make(map[string]*Topic),
-		DataDir:         "data_test",
-		DeliveryTimeout: 200 * time.Millisecond,
-		BatchSize:       100,
-	}
+	return NewBroker("data_test", 200*time.Millisecond, 100)
 }
 
 // TestPublishAndConsume 基本发布和消费
@@ -449,12 +444,7 @@ func TestGroupBatchDistribution(t *testing.T) {
 	}
 
 	// 手动把 BatchSize 改成 2（同包测试可以访问未导出字段）
-	b.Mu.RLock()
-	tp := b.Topics["grp2"]
-	b.Mu.RUnlock()
-	tp.Mu.Lock()
-	tp.BatchSize = 2
-	tp.Mu.Unlock()
+	b.BatchSize = 2
 
 	// 同一组 g1 的三个消费者，各拿一批
 	msgsA, nextA, err := b.Consume("grp2", "g1")

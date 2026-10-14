@@ -140,6 +140,23 @@ Kafka 有分区概念，一个分区同一时间只有一个消费者，所以�
 
 测试里通过 ```newTestBroker``` 设短超时（200ms），避免测试跑 5 秒。
 
+### 配置归属
+
+```BatchSize``` 和 ```DeliveryTimeout```都是 Broker 级配置，因为它们是"消费行为"的参数，不属于某个 topic：
+- ```DeliveryTimeout```：超时重投的阈值，默认 5 秒；
+- ```BatchSize```：每次 ```Consume``` 最多返回多少条，默认 100。
+
+```Topic``` 不再持有这两个字段。创建 ```Topic```时也不再复制它们，避免"同一值存两处"的隐患。
+
+### 构造函数
+
+- ```NewBroker(dataDir, deliveryTimeout, batchSize)```：初始化 Broker；
+- ```NewTopic(name, dataDir)```：初始化 Topic 的公共字段（路径、GroupStates 等）。
+
+```Publish``` 和 ```loadFromDisk```都通过 ```NewTopic``` 创建 Topic，避免字段初始化在多个地方各写一遍。
+
+注意：```loadFromDisk``` 恢复消息后，需要手动设置 ```t.Messages = msgs``` 和 ```t.NextOffset = int64(len(msgs))```，因为构造函数不接收这两个字段
+
 ## 已知限制
 
 - ACK 之后不删消息，消息文件不清理，长期运行会一直增长；
@@ -148,11 +165,11 @@ Kafka 有分区概念，一个分区同一时间只有一个消费者，所以�
 - ```Pending``` 里的消息只能靠超时清理，消费者 ACK 后才能从 ```Pending``` 移除；
 - 单机版，没有分布式协调，```Broker``` 重启后 ```Pending``` 会丢失（未 ACK 的消息会重新可消费，但已投递未 ACK 的"投递状态"不保留）；
 - 未实现认证、限流、压缩；
-- 没有 ```NewBroker``` 构造函数，所有字段需要手动初始化，容易漏设 ```BatchSize``` 或 ```DeliveryTimeout```等。
+- 未实现批量 ACK，每条消息单独发一次 ACK；
+- 没有分区，一个 topic 的消费顺序由单机保证。
 
 ## 后续可扩展方向
 
-- ```NewBroker``` 构造函数：集中初始化，避免漏设字段；
 - 批量 ACK：一次 ACK 多个 offset，减少网络往返；
 - NACK + 死信队列：消费者主动拒绝的消息进入死信；
 - 消息文件分段 + 清理策略：按大小或时间分段，删除旧段；

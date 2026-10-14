@@ -22,6 +22,16 @@ type Broker struct {
 	BatchSize       int64
 }
 
+func NewBroker(dataDir string, deliveryTimeout time.Duration, batchSize int64) *Broker {
+	broker := &Broker{
+		Topics:          make(map[string]*Topic),
+		DataDir:         dataDir,
+		DeliveryTimeout: deliveryTimeout,
+		BatchSize:       batchSize,
+	}
+	return broker
+}
+
 func (b *Broker) Publish(topic string, body string) (Message, error) {
 	b.Mu.RLock()
 	t, ok := b.Topics[topic]
@@ -30,15 +40,7 @@ func (b *Broker) Publish(topic string, body string) (Message, error) {
 		b.Mu.Lock()
 		t, ok = b.Topics[topic]
 		if !ok {
-			t = &Topic{
-				Name:            topic,
-				NextOffset:      0,
-				FilePath:        filepath.Join(b.DataDir, topic+".log"),
-				MetaPath:        filepath.Join(b.DataDir, topic+".meta"),
-				GroupStates:     make(map[string]*GroupState),
-				DeliveryTimeout: b.DeliveryTimeout,
-				BatchSize:       b.BatchSize,
-			}
+			t = NewTopic(topic, b.DataDir)
 			b.Topics[topic] = t
 		}
 		b.Mu.Unlock()
@@ -100,9 +102,9 @@ func (b *Broker) Consume(topic, group string) ([]Message, int64, error) {
 	var result []Message
 
 	var count int64 = 0
-	for i := start; i < t.NextOffset && count < t.BatchSize; i++ {
+	for i := start; i < t.NextOffset && count < b.BatchSize; i++ {
 		msg := t.Messages[i]
-		if deliveredAt, ok := g.Pending[msg.ID]; ok && now.Sub(deliveredAt) < t.DeliveryTimeout {
+		if deliveredAt, ok := g.Pending[msg.ID]; ok && now.Sub(deliveredAt) < b.DeliveryTimeout {
 			continue
 		}
 		result = append(result, msg)
@@ -239,15 +241,9 @@ func (b *Broker) loadFromDisk() error {
 			}
 
 			metaPath := filepath.Join(b.DataDir, topic+".meta")
-			t := &Topic{Name: topic,
-				Messages:        msgs,
-				NextOffset:      int64(len(msgs)),
-				FilePath:        path,
-				MetaPath:        metaPath,
-				GroupStates:     make(map[string]*GroupState),
-				DeliveryTimeout: b.DeliveryTimeout,
-				BatchSize:       b.BatchSize,
-			}
+			t := NewTopic(topic, b.DataDir)
+			t.Messages = msgs
+			t.NextOffset = int64(len(msgs))
 			b.Topics[topic] = t
 
 			if data, err := os.ReadFile(metaPath); err == nil {
@@ -340,7 +336,7 @@ func (b *Broker) startRedeliveryLoop() {
 				t.Mu.Lock()
 				for _, g := range t.GroupStates {
 					for id, deliveredAt := range g.Pending {
-						if now.Sub(deliveredAt) > t.DeliveryTimeout {
+						if now.Sub(deliveredAt) > b.DeliveryTimeout {
 							delete(g.Pending, id)
 						}
 					}

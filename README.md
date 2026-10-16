@@ -102,22 +102,23 @@ go test -race -v ./...
 type GroupState struct {
     AckedOffset int64
     Pending     map[int64]time.Time
+    AckedSet    map[int64]bool
 }
 ```
 
-- ```AckedOffset```：这个组已确认到哪；
-- ```Pending```：这个组已分发但未 ACK 的消息，key 是消息 ID，value 是投递时间。
+#### AckedOffset 与 AckedSet
 
-```Consume``` 的分发逻辑：
+`AckedOffset` 表示“从 0 开始，连续确认到哪”。它只推**连续前缀**，不推最大值。
 
-1. 从 ```AckedOffset``` 开始扫描消息；
-2. 跳过 ```Pending``` 里未超时的（说明已有人领了，正在处理）；
-3. 收满 ```BatchSize``` 条就停；
-4. 把收进结果的消息记入 ```Pending```。
+为什么需要 `AckedSet`：ACK 到达的顺序可能是乱序的。比如先 ACK 5，再 ACK 3，此时 offset 4 还没确认，`AckedOffset` 不能推到 6，否则 4 就永远丢了。
 
-这实现了组内分摊：消费者 A 领了前 100 条，B 来时 A 还没 ACK，那 100 条在 Pending 里被跳过，B 自动拿到下一批。
+`AckedSet` 兜住那些“已经确认、但前面还有空洞、暂时推不动 `AckedOffset`”的 offset。等前面的空洞补上后，循环会一次性把它们推进 `AckedOffset`，并从集合里删掉。
 
-不同组之间完全独立：每个组有自己的 AckedOffset 和 Pending，互不影响。
+`Consume` 扫描时同时跳过两类消息：
+- `AckedSet` 里的（已确认，只是水位线还没推过来）；
+- `Pending` 里未超时的（已分发，正在处理）。
+
+这三者配合，既不会重复投递已确认的消息，也不会丢掉有空洞的确认。
 
 ### 超时重投
 
@@ -167,6 +168,7 @@ Kafka 有分区概念，一个分区同一时间只有一个消费者，所以�
 - 未实现认证、限流、压缩；
 - 未实现批量 ACK，每条消息单独发一次 ACK；
 - 没有分区，一个 topic 的消费顺序由单机保证。
+- `AckedSet` 不持久化：Broker 重启后，`AckedSet` 里的乱序确认会丢失，`AckedOffset` 只恢复到 `.meta` 里存的连续前缀。已经 ACK 但前面有空洞的消息，重启后会被重新投递（符合至少一次语义，但会多一次重复消费）。
 
 ## 后续可扩展方向
 
@@ -174,6 +176,7 @@ Kafka 有分区概念，一个分区同一时间只有一个消费者，所以�
 - NACK + 死信队列：消费者主动拒绝的消息进入死信；
 - 消息文件分段 + 清理策略：按大小或时间分段，删除旧段；
 - 消息压缩：对 ```.log``` 文件做压缩；
+- 持久化 `AckedSet`：把乱序确认也写入 `.meta`，重启后不重复投递，接近“精确一次”语义；
 - 分区支持：一个 topic 分多个 partition，每个 partition 独立消费；
 - 分布式部署：多机 Broker + 一致性协议（Raft）。
 

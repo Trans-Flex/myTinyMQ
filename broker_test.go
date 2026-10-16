@@ -504,3 +504,53 @@ func TestGroupBatchDistribution(t *testing.T) {
 		t.Errorf("消息已分完，期望 0 条，实际 %d 条", len(msgsD))
 	}
 }
+
+func TestConsumeSkipsAckedSet(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b := newTestBroker()
+
+	// 发 3 条消息：offset 0、1、2
+	for i := 0; i < 3; i++ {
+		if _, err := b.Publish("ackset", "msg"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 第一次 Consume，把 3 条都领进 Pending
+	msgs, _, err := b.Consume("ackset", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条，实际 %d", len(msgs))
+	}
+
+	// ACK 1、2（乱序），不 ACK 0
+	// 此时：AckedSet = {1, 2}，AckedOffset = 0（0 没 ACK，推不动）
+	if err := b.Ack("ackset", "default", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ack("ackset", "default", 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// 等 Pending 超时（newTestBroker 里是 200ms）
+	time.Sleep(300 * time.Millisecond)
+
+	// 第二次 Consume：
+	//   offset 0 不在 AckedSet，不在 Pending（超时了）→ 应该返回
+	//   offset 1 在 AckedSet → 必须跳过（如果没跳过，会重复投递已 ACK 的消息）
+	//   offset 2 在 AckedSet → 必须跳过
+	msgs, _, err = b.Consume("ackset", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("期望只返回 1 条（offset 0），实际 %d", len(msgs))
+	}
+	if msgs[0].ID != 0 {
+		t.Errorf("期望 ID = 0，实际 %d", msgs[0].ID)
+	}
+}

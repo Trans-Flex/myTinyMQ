@@ -9,6 +9,7 @@ import (
 type GroupState struct {
 	AckedOffset int64
 	Pending     map[int64]time.Time
+	AckedSet    map[int64]bool
 }
 
 type Topic struct {

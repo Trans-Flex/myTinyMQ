@@ -89,6 +89,7 @@ func (b *Broker) Consume(topic, group string) ([]Message, int64, error) {
 		g = &GroupState{
 			AckedOffset: 0,
 			Pending:     make(map[int64]time.Time),
+			AckedSet:    make(map[int64]bool),
 		}
 		t.GroupStates[group] = g
 	}
@@ -104,6 +105,9 @@ func (b *Broker) Consume(topic, group string) ([]Message, int64, error) {
 	var count int64 = 0
 	for i := start; i < t.NextOffset && count < b.BatchSize; i++ {
 		msg := t.Messages[i]
+		if g.AckedSet[msg.ID] {
+			continue
+		}
 		if deliveredAt, ok := g.Pending[msg.ID]; ok && now.Sub(deliveredAt) < b.DeliveryTimeout {
 			continue
 		}
@@ -288,6 +292,7 @@ func (b *Broker) Ack(topic, group string, offset int64) error {
 		g = &GroupState{
 			AckedOffset: 0,
 			Pending:     make(map[int64]time.Time),
+			AckedSet:    make(map[int64]bool),
 		}
 		t.GroupStates[group] = g
 	}
@@ -302,7 +307,12 @@ func (b *Broker) Ack(topic, group string, offset int64) error {
 		return nil
 	}
 
-	newOffset := offset + 1
+	g.AckedSet[offset] = true
+	newOffset := g.AckedOffset
+	for g.AckedSet[newOffset] {
+		delete(g.AckedSet, newOffset)
+		newOffset++
+	}
 	groups := make(map[string]int64)
 	for name, gs := range t.GroupStates {
 		groups[name] = gs.AckedOffset

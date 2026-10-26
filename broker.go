@@ -23,6 +23,7 @@ type Broker struct {
 }
 
 func NewBroker(dataDir string, deliveryTimeout time.Duration, batchSize int64) *Broker {
+	os.MkdirAll(dataDir, 0755)
 	broker := &Broker{
 		Topics:          make(map[string]*Topic),
 		DataDir:         dataDir,

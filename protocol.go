@@ -16,11 +16,12 @@ const (
 )
 
 type Request struct {
-	Cmd    Cmd    `json:"cmd"`
-	Topic  string `json:"topic"`
-	Body   string `json:"body,omitempty"`
-	Offset int64  `json:"offset,omitempty"`
-	Group  string `json:"group,omitempty"`
+	Cmd     Cmd     `json:"cmd"`
+	Topic   string  `json:"topic"`
+	Body    string  `json:"body,omitempty"`
+	Offset  int64   `json:"offset,omitempty"`
+	Group   string  `json:"group,omitempty"`
+	Offsets []int64 `json:"offsets,omitempty"`
 }
 
 type Response struct {

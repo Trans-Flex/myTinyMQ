@@ -193,10 +193,73 @@ func (b *Broker) handleConsume(req Request) Response {
 
 func (b *Broker) handleAck(req Request) Response {
 	group := groupOrDefault(req)
+
+	if len(req.Offsets) > 0 {
+		if err := b.BatchAck(req.Topic, group, req.Offsets); err != nil {
+			return Response{Status: StatusError, Error: err.Error()}
+		}
+		return Response{Status: StatusOK}
+	}
+
 	if err := b.Ack(req.Topic, group, req.Offset); err != nil {
 		return Response{Status: StatusError, Error: err.Error()}
 	}
 	return Response{Status: StatusOK}
+}
+
+func (b *Broker) BatchAck(topic, group string, offsets []int64) error {
+	if len(offsets) == 0 {
+		return nil
+	}
+
+	b.Mu.RLock()
+	t, ok := b.Topics[topic]
+	b.Mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("不存在的 topic: %s", topic)
+	}
+
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+
+	g, ok := t.GroupStates[group]
+	if !ok {
+		g = &GroupState{
+			AckedOffset: 0,
+			Pending:     make(map[int64]time.Time),
+			AckedSet:    make(map[int64]bool),
+		}
+		t.GroupStates[group] = g
+	}
+
+	for _, offset := range offsets {
+		if offset < 0 || offset >= t.NextOffset {
+			continue
+		}
+		g.AckedSet[offset] = true
+		delete(g.Pending, offset)
+	}
+
+	newOffset := g.AckedOffset
+	for g.AckedSet[newOffset] {
+		delete(g.AckedSet, newOffset)
+		newOffset++
+	}
+
+	groups := make(map[string]int64)
+	for name, gs := range t.GroupStates {
+		groups[name] = gs.AckedOffset
+	}
+	groups[group] = newOffset
+
+	data, _ := json.Marshal(map[string]any{"groups": groups})
+	if err := os.WriteFile(t.MetaPath, data, 0644); err != nil {
+		return err
+	}
+
+	g.AckedOffset = newOffset
+	return nil
 }
 
 func (b *Broker) loadFromDisk() error {

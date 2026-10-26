@@ -554,3 +554,47 @@ func TestConsumeSkipsAckedSet(t *testing.T) {
 		t.Errorf("期望 ID = 0，实际 %d", msgs[0].ID)
 	}
 }
+
+func TestBatchAck(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b := newTestBroker()
+
+	// 1. 发 5 条
+	for i := 0; i < 5; i++ {
+		b.Publish("batch", "msg")
+	}
+
+	// 2. 拉取（进入 Pending）
+	msgs, _, _ := b.Consume("batch", "g1")
+	if len(msgs) != 5 {
+		t.Fatalf("期望 5 条，实际 %d 条", len(msgs))
+	}
+
+	// 3. 批量 ACK
+	offsets := []int64{0, 1, 2, 3, 4}
+	err := b.BatchAck("batch", "g1", offsets)
+	if err != nil {
+		t.Fatalf("BatchAck 失败: %v", err)
+	}
+
+	// 4. 验证状态
+	b.Mu.RLock()
+	topic := b.Topics["batch"]
+	b.Mu.RUnlock()
+
+	topic.Mu.Lock()
+	defer topic.Mu.Unlock()
+
+	g := topic.GroupStates["g1"]
+	if g.AckedOffset != 5 {
+		t.Errorf("期望 AckedOffset = 5，实际 = %d", g.AckedOffset)
+	}
+	if len(g.Pending) != 0 {
+		t.Errorf("期望 Pending 为空，实际剩 %d 个", len(g.Pending))
+	}
+	if len(g.AckedSet) != 0 {
+		t.Errorf("期望 AckedSet 为空，实际剩 %d 个", len(g.AckedSet))
+	}
+}

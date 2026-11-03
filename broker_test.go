@@ -598,3 +598,88 @@ func TestBatchAck(t *testing.T) {
 		t.Errorf("期望 AckedSet 为空，实际剩 %d 个", len(g.AckedSet))
 	}
 }
+
+func TestAckedSetPersistence(t *testing.T) {
+	os.RemoveAll("data_test")
+	os.MkdirAll("data_test", 0755)
+
+	b1 := newTestBroker()
+
+	// 1. 发 5 条消息（offset 0 到 4）
+	for i := 0; i < 5; i++ {
+		_, err := b1.Publish("persist_set", "msg")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 2. 把这 5 条全部拉出来（此时它们都进入了 Pending）
+	msgs, _, err := b1.Consume("persist_set", "group1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("期望消费 5 条，实际 %d 条", len(msgs))
+	}
+
+	// 3. 乱序 ACK：只确认 0, 2, 4
+	// 此时内存中：AckedOffset = 1，AckedSet = {2, 4}，Pending 里剩 {1, 3}
+	if err := b1.Ack("persist_set", "group1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Ack("persist_set", "group1", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Ack("persist_set", "group1", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// 验证 b1 的内存状态是否正确（算是个双重检查）
+	b1.Mu.RLock()
+	t1 := b1.Topics["persist_set"]
+	b1.Mu.RUnlock()
+	t1.Mu.Lock()
+	g1 := t1.GroupStates["group1"]
+	if g1.AckedOffset != 1 {
+		t.Fatalf("b1 期望 AckedOffset = 1，实际 = %d", g1.AckedOffset)
+	}
+	if len(g1.AckedSet) != 2 {
+		t.Fatalf("b1 期望 AckedSet 有 2 个元素，实际 = %d", len(g1.AckedSet))
+	}
+	t1.Mu.Unlock()
+
+	// 4. 模拟重启：新建 b2 并加载磁盘数据
+	b2 := newTestBroker()
+	if err := b2.loadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 验证 b2 恢复后的内存状态
+	b2.Mu.RLock()
+	t2 := b2.Topics["persist_set"]
+	b2.Mu.RUnlock()
+	t2.Mu.Lock()
+	g2 := t2.GroupStates["group1"]
+	if g2.AckedOffset != 1 {
+		t.Errorf("b2 恢复期望 AckedOffset = 1，实际 = %d", g2.AckedOffset)
+	}
+	if !g2.AckedSet[2] || !g2.AckedSet[4] {
+		t.Errorf("b2 恢复期望 AckedSet 包含 {2, 4}，实际为 %v", g2.AckedSet)
+	}
+	t2.Mu.Unlock()
+
+	// 5. 【终极验证】再次消费
+	// 因为 0,2,4 已经 ACK 并被持久化，1,3 在 b1 的 Pending 里但重启后 Pending 是空的，所以会被重新投递
+	// 期望：只能拿到 offset 1 和 3 的消息
+	msgs2, _, err := b2.Consume("persist_set", "group1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(msgs2) != 2 {
+		t.Fatalf("重启后期望拿到 2 条未确认的消息，实际拿到 %d 条", len(msgs2))
+	}
+	if msgs2[0].ID != 1 || msgs2[1].ID != 3 {
+		t.Errorf("期望重新拿到的消息 ID 是 1 和 3，实际是 %d 和 %d", msgs2[0].ID, msgs2[1].ID)
+	}
+}

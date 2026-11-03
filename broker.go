@@ -247,13 +247,27 @@ func (b *Broker) BatchAck(topic, group string, offsets []int64) error {
 		newOffset++
 	}
 
-	groups := make(map[string]int64)
-	for name, gs := range t.GroupStates {
-		groups[name] = gs.AckedOffset
+	metaData := MetaData{
+		Groups: make(map[string]GroupMeta),
 	}
-	groups[group] = newOffset
+	for name, gs := range t.GroupStates {
+		var ackedSet []int64
+		for k := range gs.AckedSet {
+			ackedSet = append(ackedSet, k)
+		}
 
-	data, _ := json.Marshal(map[string]any{"groups": groups})
+		currentOffset := gs.AckedOffset
+		if name == group {
+			currentOffset = newOffset
+		}
+
+		metaData.Groups[name] = GroupMeta{
+			Offset:   currentOffset,
+			AckedSet: ackedSet,
+		}
+	}
+
+	data, _ := json.Marshal(metaData)
 	if err := os.WriteFile(t.MetaPath, data, 0644); err != nil {
 		return err
 	}
@@ -315,17 +329,21 @@ func (b *Broker) loadFromDisk() error {
 			b.Topics[topic] = t
 
 			if data, err := os.ReadFile(metaPath); err == nil {
-				var meta struct {
-					Groups map[string]int64 `json:"groups"`
-				}
-				if err := json.Unmarshal(data, &meta); err == nil {
-					for name, acked := range meta.Groups {
-						t.GroupStates[name] = &GroupState{
-							AckedOffset: acked,
+				var metaData MetaData
+				if err := json.Unmarshal(data, &metaData); err == nil {
+					for name, gMeta := range metaData.Groups {
+						gState := &GroupState{
+							AckedOffset: gMeta.Offset,
 							Pending:     make(map[int64]time.Time),
+							AckedSet:    make(map[int64]bool),
 						}
-					}
 
+						for _, offset := range gMeta.AckedSet {
+							gState.AckedSet[offset] = true
+						}
+
+						t.GroupStates[name] = gState
+					}
 				}
 			}
 			if len(t.GroupStates) == 0 {
@@ -377,13 +395,27 @@ func (b *Broker) Ack(topic, group string, offset int64) error {
 		delete(g.AckedSet, newOffset)
 		newOffset++
 	}
-	groups := make(map[string]int64)
-	for name, gs := range t.GroupStates {
-		groups[name] = gs.AckedOffset
+	metaData := MetaData{
+		Groups: make(map[string]GroupMeta),
 	}
-	groups[group] = newOffset
+	for name, gs := range t.GroupStates {
+		var ackedSet []int64
+		for k := range gs.AckedSet {
+			ackedSet = append(ackedSet, k)
+		}
 
-	data, _ := json.Marshal(map[string]any{"groups": groups})
+		currentOffset := gs.AckedOffset
+		if name == group {
+			currentOffset = newOffset
+		}
+
+		metaData.Groups[name] = GroupMeta{
+			Offset:   currentOffset,
+			AckedSet: ackedSet,
+		}
+	}
+
+	data, _ := json.Marshal(metaData)
 	if err := os.WriteFile(t.MetaPath, data, 0644); err != nil {
 		return err
 	}
